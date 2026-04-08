@@ -132,7 +132,7 @@ launch_chrome() {
   echo "Launching Chrome for '$project_name' on port $port..."
   "$chrome_path" \
     --remote-debugging-port="$port" \
-    --user-data-dir="/tmp/chrome-$project_name" &
+    --user-data-dir="/tmp/chrome-$project_name" 2>/dev/null &
 }
 
 # --- Scanning ---
