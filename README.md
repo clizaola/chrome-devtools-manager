@@ -23,47 +23,56 @@ When using Chrome DevTools MCP with tools like [Claude Code](https://claude.com/
 - **Auto-assign ports** when adding Chrome DevTools MCP to new projects
 - **Configurable search paths** so it finds projects wherever you keep them
 - **Creates/updates `.mcp.json`** files automatically with `jq`
+- **Removes `chrome-devtools`** from a project's `.mcp.json` when you no longer need it
+- **Health check (`--doctor`)** that reports stale entries, drift, conflicts, and unregistered projects — without touching anything
+- **Profile cleanup (`--clean`)** that wipes `/tmp/chrome-<project>` for the current project (or all of them with `--all`), with `--force` to also kill active Chrome instances
 
 ## Requirements
 
 - **Operating System:** macOS, Linux, or Windows via WSL2
 - **Shell:** bash or zsh
 - **Chrome/Chromium:** Google Chrome or Chromium installed
-- **jq:** Required only for the `--add` command (see install instructions below)
-- **Node.js/npx:** Required by Chrome DevTools MCP itself
+- **jq:** Required for `--add` and `--remove` (JSON manipulation)
+- **curl:** Optional but recommended. Enables post-launch verification (polling the Chrome DevTools Protocol endpoint to confirm Chrome is actually up) and the `[DEAD]` liveness checks in `--doctor`. The script still works without it — those checks are silently skipped.
+- **Node.js / npx:** Required by Chrome DevTools MCP itself (not by this script directly, but by the MCP server it helps you run)
 
-### Installing jq
+### Installing jq and curl
 
-`jq` is only needed if you use `--add` to configure projects automatically. All other commands work without it.
+`jq` is needed for `--add` and `--remove`. `curl` ships with every major OS but if it's missing you may want to install it too.
 
 ```bash
-# macOS
+# macOS (curl is pre-installed)
 brew install jq
 
 # Ubuntu / Debian
-sudo apt install jq
+sudo apt install jq curl
 
 # Fedora / RHEL
-sudo dnf install jq
+sudo dnf install jq curl
 ```
 
 ## Installation
 
-### 1. Download the script
+The recommended install path is a git clone + symlink, so you can `git pull` for updates.
+
+### 1. Clone the repository
 
 ```bash
-# Create the directory if it doesn't exist
-mkdir -p ~/.local/bin
-
-# Download the script
-curl -o ~/.local/bin/chrome-devtools-manager \
-  https://gist.githubusercontent.com/clizaola/GIST_ID/raw/chrome-devtools-manager.sh
-
-# Make it executable
-chmod +x ~/.local/bin/chrome-devtools-manager
+git clone https://github.com/clizaola/chrome-devtools-manager.git ~/Code/chrome-devtools-manager
 ```
 
-### 2. Add `~/.local/bin` to your PATH (if not already)
+(You can clone it anywhere — `~/Code/chrome-devtools-manager` is just a convention.)
+
+### 2. Symlink the script into your `PATH`
+
+```bash
+mkdir -p ~/.local/bin
+ln -s ~/Code/chrome-devtools-manager/chrome-devtools-manager.sh ~/.local/bin/chrome-devtools-manager
+```
+
+Using a symlink means every `git pull` updates the command automatically — no reinstall step needed.
+
+### 3. Add `~/.local/bin` to your `PATH` (if not already)
 
 Add this line to your `~/.zshrc` or `~/.bashrc`:
 
@@ -77,11 +86,33 @@ Then reload your shell:
 source ~/.zshrc   # or source ~/.bashrc
 ```
 
-### 3. Verify installation
+### 4. Verify installation
 
 ```bash
 chrome-devtools-manager --help
 ```
+
+### Updating
+
+```bash
+cd ~/Code/chrome-devtools-manager
+git pull
+```
+
+The symlink points at the script in the git working tree, so `git pull` is all you need — nothing to reinstall.
+
+### Single-file alternative
+
+If you don't want to clone a repo, you can grab just the script directly from GitHub:
+
+```bash
+mkdir -p ~/.local/bin
+curl -o ~/.local/bin/chrome-devtools-manager \
+  https://raw.githubusercontent.com/clizaola/chrome-devtools-manager/main/chrome-devtools-manager.sh
+chmod +x ~/.local/bin/chrome-devtools-manager
+```
+
+Tradeoff: updating requires re-running the `curl` command instead of `git pull`.
 
 ## Usage
 
@@ -94,6 +125,11 @@ chrome-devtools-manager
 ```
 
 This reads the port from the project's `.mcp.json` and launches an isolated Chrome instance with its own user profile. Each project gets completely separate cookies, sessions, and state.
+
+The launcher also:
+
+- **Refuses to launch** if a Chrome process is already running for this project's profile directory on a different port (Chrome's profile singleton would silently ignore the new port flag, so this would be a foot-gun). It tells you exactly which command to run to kill the stale instance.
+- **Verifies Chrome actually bound the port** after launch by polling `http://127.0.0.1:<port>/json/version` for up to 5 seconds. If the endpoint doesn't respond, you get a warning instead of a silent failure.
 
 ### View port registry
 
@@ -189,6 +225,100 @@ The generated `.mcp.json` entry looks like this:
 }
 ```
 
+### Remove Chrome DevTools MCP from a project
+
+When you no longer want `chrome-devtools` in a project's `.mcp.json`, navigate to the project and run:
+
+```bash
+cd ~/projects/old-project
+chrome-devtools-manager --remove
+```
+
+This removes only the `chrome-devtools` entry from `mcpServers`, preserving all other MCP servers. The registry is rescanned automatically so the project's port is freed for reuse. Requires `jq`.
+
+### Run a health check (`--doctor`)
+
+```bash
+chrome-devtools-manager --doctor
+```
+
+A **non-destructive** diagnostic that inspects the current registry and your `.mcp.json` files and reports any issues it finds. It does not modify any files or the registry — you decide what to fix. Useful when something feels off (missing project, wrong port, conflict) and you want a quick health report before deciding what to run.
+
+It reports:
+
+- **`[STALE]`** — the project directory is gone, or `.mcp.json` no longer contains `chrome-devtools`
+- **`[DRIFT]`** — the port in `.mcp.json` no longer matches the port in the registry (something external edited the file)
+- **`[WARN]`** — a project's `chrome-devtools` entry uses a host other than `127.0.0.1` or `localhost`, so its port can't be detected
+- **`[CONFLICT]`** — two or more projects share the same port
+- **`[WRONG-PORT]`** — a Chrome instance is running with this project's profile directory but on a different port than `.mcp.json` wants. This happens when the configured port changes after Chrome was already launched; Chrome's profile singleton silently reuses the old session. The fix is to kill that Chrome process and relaunch.
+- **`[DEAD]`** — informational. A registered project whose configured port is not currently listening. This is normal for projects you're not actively using. Not counted as an issue.
+- **`[ORPHAN]`** — a project on disk has `chrome-devtools` in its `.mcp.json` but isn't in the registry (run `--scan` to pick it up)
+
+Example output:
+
+```
+Chrome DevTools MCP Doctor
+===========================
+
+Checking registered projects...
+  [CONFLICT] port 9229 used by: cafali,omniguard360
+
+Scanning search paths for unregistered projects...
+  [ORPHAN]   new-project at ~/Code/new-project (not in registry)
+
+Found 2 issue(s).
+
+Suggested actions:
+  chrome-devtools-manager --scan                              Rebuild registry from disk (fixes STALE, DRIFT, ORPHAN)
+  cd <project> && chrome-devtools-manager --remove            Drop a stale/unwanted entry
+  cd <project> && chrome-devtools-manager --remove && chrome-devtools-manager --add   Reassign a conflicting port
+```
+
+### Clean up profile directories (`--clean`)
+
+Chrome profiles for each project live in `/tmp/chrome-<project>/` and can grow very large over time — browser cache, service workers, IndexedDB, etc. A single project can easily hit multiple GB after heavy use. Temp profiles are cleared on reboot, but `--clean` lets you free disk space or reset a misbehaving browser state without rebooting.
+
+**By default, `--clean` only touches the current project's profile.** Use `--all` if you want to clean every project at once.
+
+```bash
+# Clean ONLY the current project's profile (/tmp/chrome-<basename $PWD>)
+cd ~/Code/myproject
+chrome-devtools-manager --clean
+
+# Clean the current project's profile AND kill it first if it's running
+chrome-devtools-manager --clean --force
+
+# Clean every /tmp/chrome-* profile. Skips any Chrome that is currently running.
+chrome-devtools-manager --clean --all
+
+# Nuclear: kill every running Chrome and wipe every profile
+chrome-devtools-manager --clean --all --force
+```
+
+Example output (`--clean --all`):
+
+```
+Scanning /tmp/ for Chrome profile directories...
+
+  [CLEAN]      cafali (246M)
+  [CLEAN]      greenmedinfo (270M)
+  [SKIP]       gumplayfactory (active on port 9234, 902M)
+  [CLEAN]      homer (4.3G)
+  [CLEAN]      kozmetik (5.3G)
+
+Cleaned 4 profile(s), skipped 1.
+
+To also kill active Chrome instances and clean their profiles, add --force.
+```
+
+**Safety defaults:**
+
+- `--clean` without `--all` only touches `/tmp/chrome-<basename $PWD>`. Much smaller blast radius when you just want to reset one project.
+- `--clean` without `--force` never kills a running Chrome. Active profiles are reported as `[SKIP]` and left alone.
+- Use `--force` only when you're sure you want to terminate the Chrome window.
+
+**Note:** MCP screenshots and snapshots are transmitted through the MCP protocol — they are **not** stored in these profile directories. The size you see is normal Chrome browser state (cache, cookies, local storage, etc.) from any browsing you did in the debugging windows. Cleaning only logs you out of sites in that profile; nothing MCP-related is lost.
+
 ### Add custom search paths
 
 By default, the tool searches these directories for `.mcp.json` files:
@@ -240,7 +370,7 @@ api-service|9223|~/projects/api-service
 
 ### Port detection
 
-The tool finds ports by scanning `.mcp.json` files for the pattern `127.0.0.1:<port>`. It does not parse JSON for this; it uses a simple `grep` pattern. This means it works regardless of how the JSON is formatted or indented.
+The tool finds ports by scanning `.mcp.json` files for the pattern `127.0.0.1:<port>` or `localhost:<port>`. It does not parse JSON for this; it uses a simple `grep` pattern. This means it works regardless of how the JSON is formatted or indented.
 
 ### Chrome isolation
 
@@ -299,17 +429,121 @@ Works under WSL2 (Windows Subsystem for Linux). The script detects WSL2 automati
 
 2. **Temp profiles are cleared on reboot:** User profiles are stored in `/tmp/chrome-<project>`, which is cleared when you restart your machine. If you need persistent sessions (staying logged in, etc.), change the path in the script to a permanent location like `~/.chrome-devtools/<project>`.
 
-3. **Port detection is grep-based:** The tool searches for `127.0.0.1:<port>` in `.mcp.json`. If your config uses `localhost` instead of `127.0.0.1`, the port won't be detected. Always use `127.0.0.1` in your MCP config.
+3. **Port detection is grep-based:** The tool searches for `127.0.0.1:<port>` or `localhost:<port>` in `.mcp.json`. Other hostnames (e.g. `0.0.0.0`, custom domains) will not be detected.
 
-4. **One port per `.mcp.json`:** The tool reads only the first `127.0.0.1:<port>` match in each `.mcp.json`. If you have multiple MCP servers using different ports in the same file, only the first will be tracked.
+4. **One port per `.mcp.json`:** The tool reads only the first matching host:port pair in each `.mcp.json`. If you have multiple MCP servers using different ports in the same file, only the first will be tracked.
 
 5. **Search paths use glob patterns:** Paths like `~/Code/*` only match one level deep. Use `~/Code/*/*` for nested directories. The tool does NOT recurse infinitely; you must specify the depth explicitly.
 
-6. **`--add` requires `jq`:** The `--add` command uses `jq` to safely modify JSON files. All other commands (`--list`, `--scan`, launch) work without `jq`.
+6. **`--add` and `--remove` require `jq`:** These commands use `jq` to safely modify JSON files. All other commands (`--list`, `--scan`, `--doctor`, `--clean`, launch) work without `jq`.
 
 7. **Chrome path auto-detection:** The script detects Chrome automatically on macOS, Linux, and WSL2. If Chrome is installed in a non-standard location, you may need to update the `get_chrome_path()` function in the script.
 
 8. **WSL2 support is untested:** The WSL2 detection (via `/proc/version`) and Windows Chrome path should work but have not been extensively tested. If you encounter issues, please report them.
+
+## Troubleshooting
+
+### Start here: `--doctor`
+
+Almost every problem can be diagnosed in one step:
+
+```bash
+chrome-devtools-manager --doctor
+```
+
+This non-destructive check will tell you which project has a stale entry, a port conflict, a wrong port, a dead listener, or an unregistered project. Each finding comes with a suggested fix command. If `--doctor` reports no issues, the tool itself is healthy and the problem is somewhere else.
+
+### `No chrome-devtools port found in .mcp.json`
+
+The launcher found a `.mcp.json` but no `127.0.0.1:<port>` or `localhost:<port>` pattern inside it. Either:
+
+- `chrome-devtools` isn't in the file yet → run `chrome-devtools-manager --add`
+- The URL uses a host the tool can't detect (e.g. `0.0.0.0`, a custom hostname) → edit `.mcp.json` to use `127.0.0.1` or `localhost`
+
+### MCP client says `Failed to fetch browser webSocket URL from http://127.0.0.1:<port>/json/version: fetch failed`
+
+The MCP client can't reach Chrome on the configured port. This means Chrome isn't actually listening there. Run:
+
+```bash
+chrome-devtools-manager --doctor
+```
+
+If doctor shows `[DEAD]` for that project, just launch Chrome:
+
+```bash
+cd /path/to/project
+chrome-devtools-manager
+```
+
+If doctor shows `[WRONG-PORT]`, see the next section.
+
+### `[WRONG-PORT]` or `Error: Chrome is already running for '<project>' on port X, but .mcp.json is configured for port Y`
+
+**This is the most common gotcha, and the one that burned the tool's author into adding every feature on this page.**
+
+**Root cause:** Chrome has a "profile singleton" behavior. If you launch a second Chrome process pointing at a `--user-data-dir` that is already in use by another Chrome process, Chrome **silently ignores the new `--remote-debugging-port` flag** and just opens a new window in the existing session. The old port stays bound; the new port never comes up.
+
+This happens when:
+
+- You reassigned a project's port (via `--remove` + `--add` or by editing `.mcp.json`) after Chrome was already launched for that project
+- Another tool (Herd, IDE integration, etc.) rewrote `.mcp.json` and changed the port while Chrome was still running
+- A crashed Chrome left its profile-lock state behind
+
+**Fix:** kill the stale Chrome process for that specific profile, then relaunch. The launcher now detects this case and prints the exact command, but here it is manually:
+
+```bash
+pkill -f "user-data-dir=/tmp/chrome-<project-name>"
+cd /path/to/project
+chrome-devtools-manager
+```
+
+This only kills the Chrome instance holding the one specific profile directory — your other Chrome windows are untouched.
+
+### `Chrome launched but port <X> is not responding after ~5s`
+
+The launcher started Chrome but the CDP endpoint never came up. Possibilities:
+
+1. Chrome crashed at startup (rare; try launching once manually)
+2. Another process is holding the port (`lsof -iTCP:<port> -sTCP:LISTEN`)
+3. You killed the launcher too fast, before Chrome had finished booting
+4. A profile-singleton collision hid the port (run `--doctor`)
+
+### `Opening in existing browser session.`
+
+Chrome prints this itself — it means the profile singleton just redirected your launch into an already-running Chrome. The new `--remote-debugging-port` flag was ignored. Same fix as `[WRONG-PORT]` above.
+
+### `/tmp/chrome-<project>` is huge
+
+This is normal — Chrome caches web content aggressively (HTTP cache, service worker cache, IndexedDB). A single project with heavy browsing can easily grow to multiple GB. MCP screenshots and snapshots are **not** stored here; they go through the MCP protocol directly to the client.
+
+Reclaim space:
+
+```bash
+# Clean just the current project
+cd /path/to/project
+chrome-devtools-manager --clean
+
+# Or wipe everything
+chrome-devtools-manager --clean --all
+```
+
+### `cafali,omniguard360 both use port 9229` (or similar conflict)
+
+Two projects were assigned the same port. Pick one to move:
+
+```bash
+cd /path/to/project-to-move
+chrome-devtools-manager --remove
+chrome-devtools-manager --add          # auto-assigns next free port
+```
+
+### Stale entries in `--list` for projects you deleted
+
+```bash
+chrome-devtools-manager --scan
+```
+
+`--scan` rebuilds the registry from disk, so projects that no longer exist drop out automatically.
 
 ## Quick Reference
 
@@ -320,6 +554,12 @@ Works under WSL2 (Windows Subsystem for Linux). The script detects WSL2 automati
 | `chrome-devtools-manager --scan` | Rescan projects, rebuild registry |
 | `chrome-devtools-manager --add` | Add chrome-devtools to current project (auto port) |
 | `chrome-devtools-manager --add 9225` | Add with specific port |
+| `chrome-devtools-manager --remove` | Remove chrome-devtools from current project |
+| `chrome-devtools-manager --doctor` | Non-destructive health check (stale, drift, conflicts, orphans) |
+| `chrome-devtools-manager --clean` | Delete current project's `/tmp/chrome-<project>` profile |
+| `chrome-devtools-manager --clean --force` | Current project: kill Chrome first if active, then delete |
+| `chrome-devtools-manager --clean --all` | Delete every `/tmp/chrome-*` profile (skips active instances) |
+| `chrome-devtools-manager --clean --all --force` | Kill every active Chrome and wipe every profile |
 | `chrome-devtools-manager --path "~/Dir/*"` | Add a search path |
 | `chrome-devtools-manager --help` | Show help |
 
@@ -335,7 +575,7 @@ Then use `cdm`, `cdm --list`, `cdm --add`, etc.
 
 ## Feedback and Issues
 
-- Report issues: [GitHub Issues](https://github.com/clizaola/issues)
+- Report issues: [GitHub Issues](https://github.com/clizaola/chrome-devtools-manager/issues)
 - Email: support@cafali.com
 - Chrome DevTools MCP: [github.com/ChromeDevTools/chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 

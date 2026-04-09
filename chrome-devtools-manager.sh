@@ -7,6 +7,9 @@
 #   chrome-devtools-manager --list       Show port registry
 #   chrome-devtools-manager --scan       Rescan all projects and update registry
 #   chrome-devtools-manager --add [port] Add chrome-devtools to current project's .mcp.json
+#   chrome-devtools-manager --remove     Remove chrome-devtools from current project's .mcp.json
+#   chrome-devtools-manager --doctor     Non-destructive health check on the registry
+#   chrome-devtools-manager --clean [--all] [--force]  Delete chrome profile(s) from /tmp/
 #   chrome-devtools-manager --path <dir> Add a search path (e.g. ~/Projects/*)
 #   chrome-devtools-manager --help       Show help
 #
@@ -103,11 +106,45 @@ get_chrome_path() {
   esac
 }
 
+# --- Chrome process inspection ---
+
+# Return the --remote-debugging-port of the Chrome main process currently
+# using the given --user-data-dir, or empty string if none is running.
+# Filters out helper subprocesses (renderer, gpu, etc.) which inherit the
+# same flags via their command line.
+get_running_chrome_port() {
+  local profile_dir="$1"
+  ps -Ao command 2>/dev/null \
+    | grep -F "user-data-dir=$profile_dir" \
+    | grep -v grep \
+    | grep -v -- "--type=" \
+    | grep -Eo 'remote-debugging-port=[0-9]+' \
+    | head -1 \
+    | cut -d= -f2
+}
+
+# Poll the CDP endpoint until it responds or timeout expires.
+# Returns 0 if endpoint is reachable, 1 otherwise.
+wait_for_cdp() {
+  local port="$1"
+  local timeout_tenths="${2:-20}"  # default: 20 * 0.25s = 5s
+  command -v curl &>/dev/null || return 0  # skip verification if curl missing
+  local attempts=0
+  while [ "$attempts" -lt "$timeout_tenths" ]; do
+    if curl -sf -m 1 "http://127.0.0.1:$port/json/version" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
 # --- Launch Chrome ---
 
 launch_chrome() {
   local project_name=$(basename "$PWD")
-  local port=$(grep -o '127\.0\.0\.1:[0-9]*' .mcp.json 2>/dev/null | head -1 | cut -d: -f2)
+  local port=$(grep -Eo '(127\.0\.0\.1|localhost):[0-9]+' .mcp.json 2>/dev/null | head -1 | cut -d: -f2)
 
   if [ -z "$port" ]; then
     echo "No chrome-devtools port found in .mcp.json"
@@ -115,6 +152,41 @@ launch_chrome() {
     echo "Add chrome-devtools to this project:"
     echo "  $CMD_NAME --add"
     return 1
+  fi
+
+  local profile_dir="/tmp/chrome-$project_name"
+
+  # Pre-launch: detect a stale Chrome instance already holding this profile.
+  # Chrome's profile singleton will silently ignore --remote-debugging-port
+  # on a second invocation and just open a new window in the existing
+  # session, so the port flag quietly does nothing.
+  local running_port=$(get_running_chrome_port "$profile_dir")
+  if [ -n "$running_port" ]; then
+    if [ "$running_port" = "$port" ]; then
+      echo "Chrome is already running for '$project_name' on port $port."
+      echo "Reusing existing session (nothing to do)."
+      if wait_for_cdp "$port" 4; then
+        echo "CDP endpoint http://127.0.0.1:$port is responding."
+      else
+        echo "Warning: Chrome process exists but CDP endpoint is not responding."
+        echo "Consider killing it and retrying:"
+        echo "  pkill -f \"user-data-dir=$profile_dir\""
+      fi
+      return 0
+    else
+      echo "Error: Chrome is already running for '$project_name' on port $running_port,"
+      echo "but .mcp.json is configured for port $port."
+      echo ""
+      echo "Chrome's profile singleton will ignore the new --remote-debugging-port"
+      echo "flag and reuse the existing session, so MCP on port $port will fail."
+      echo ""
+      echo "Kill the stale instance first:"
+      echo ""
+      echo "  pkill -f \"user-data-dir=$profile_dir\""
+      echo ""
+      echo "Then retry: $CMD_NAME"
+      return 1
+    fi
   fi
 
   local chrome_path=$(get_chrome_path)
@@ -132,7 +204,19 @@ launch_chrome() {
   echo "Launching Chrome for '$project_name' on port $port..."
   "$chrome_path" \
     --remote-debugging-port="$port" \
-    --user-data-dir="/tmp/chrome-$project_name" 2>/dev/null &
+    --user-data-dir="$profile_dir" 2>/dev/null &
+
+  # Post-launch: verify Chrome actually bound the expected port.
+  if wait_for_cdp "$port"; then
+    echo "Chrome is ready. CDP endpoint: http://127.0.0.1:$port"
+  else
+    echo ""
+    echo "Warning: Chrome launched but port $port is not responding after ~5s."
+    echo "  - Check that Chrome actually opened a window"
+    echo "  - Run: $CMD_NAME --doctor"
+    echo "  - If a stale process exists: pkill -f \"user-data-dir=$profile_dir\""
+    return 1
+  fi
 }
 
 # --- Scanning ---
@@ -151,7 +235,7 @@ scan_projects() {
     local expanded=$(echo "$pattern" | sed "s|^~|$HOME|")
     for file in $expanded/.mcp.json; do
       [ -f "$file" ] || continue
-      local port=$(grep -o '127\.0\.0\.1:[0-9]*' "$file" 2>/dev/null | head -1 | cut -d: -f2)
+      local port=$(grep -Eo '(127\.0\.0\.1|localhost):[0-9]+' "$file" 2>/dev/null | head -1 | cut -d: -f2)
       [ -z "$port" ] && continue
       local project_dir=$(dirname "$file")
       local project_name=$(basename "$project_dir")
@@ -290,7 +374,7 @@ add_to_project() {
   if [ -f "$mcp_file" ]; then
     if jq -e '.mcpServers["chrome-devtools"]' "$mcp_file" &>/dev/null; then
       echo "chrome-devtools already configured in $mcp_file"
-      local existing_port=$(grep -o '127\.0\.0\.1:[0-9]*' "$mcp_file" | head -1 | cut -d: -f2)
+      local existing_port=$(grep -Eo '(127\.0\.0\.1|localhost):[0-9]+' "$mcp_file" | head -1 | cut -d: -f2)
       echo "Current port: $existing_port"
       return 1
     fi
@@ -316,6 +400,260 @@ add_to_project() {
   echo ""
   echo "Launch Chrome with: $CMD_NAME"
   echo ""
+
+  scan_projects
+  show_registry
+  echo "Registry saved to ~/.chrome-devtools-manager"
+}
+
+# --- Clean: delete /tmp/chrome-* profile directories ---
+#
+# Default scope: CURRENT project only (basename of $PWD).
+# With --all: every /tmp/chrome-* profile directory.
+# With --force: kills active Chrome instances before deleting (otherwise skipped).
+
+clean_profiles() {
+  local all=false
+  local force=false
+
+  for arg in "$@"; do
+    case "$arg" in
+      --all|-a) all=true ;;
+      --force|-f) force=true ;;
+      "") ;;
+      *)
+        echo "Error: unknown flag '$arg'"
+        echo "Usage: $CMD_NAME --clean [--all] [--force]"
+        return 1
+        ;;
+    esac
+  done
+
+  local profiles=()
+
+  if $all; then
+    for p in /tmp/chrome-*; do
+      [ -d "$p" ] && profiles+=("$p")
+    done
+    if [ ${#profiles[@]} -eq 0 ]; then
+      echo "No Chrome profile directories found in /tmp/"
+      return 0
+    fi
+    echo "Scanning /tmp/ for Chrome profile directories..."
+  else
+    local project_name=$(basename "$PWD")
+    local profile_dir="/tmp/chrome-$project_name"
+    if [ ! -d "$profile_dir" ]; then
+      echo "No profile directory for current project '$project_name' ($profile_dir does not exist)."
+      echo ""
+      echo "Options:"
+      echo "  cd into the project you want to clean, then: $CMD_NAME --clean"
+      echo "  Or clean every profile at once:              $CMD_NAME --clean --all"
+      return 0
+    fi
+    profiles+=("$profile_dir")
+    echo "Cleaning profile for current project: $project_name"
+  fi
+
+  echo ""
+
+  local cleaned=0
+  local skipped=0
+
+  for profile_dir in "${profiles[@]}"; do
+    [ -d "$profile_dir" ] || continue
+    local name=${profile_dir#/tmp/chrome-}
+    local size=$(du -sh "$profile_dir" 2>/dev/null | cut -f1)
+    local running_port=$(get_running_chrome_port "$profile_dir")
+
+    if [ -n "$running_port" ]; then
+      if $force; then
+        echo "  [KILL+CLEAN] $name (active on port $running_port, $size)"
+        pkill -f "user-data-dir=$profile_dir" 2>/dev/null
+        # Give Chrome a moment to release file handles
+        sleep 1
+        rm -rf "$profile_dir"
+        cleaned=$((cleaned + 1))
+      else
+        echo "  [SKIP]       $name (active on port $running_port, $size)"
+        skipped=$((skipped + 1))
+      fi
+    else
+      echo "  [CLEAN]      $name ($size)"
+      rm -rf "$profile_dir"
+      cleaned=$((cleaned + 1))
+    fi
+  done
+
+  echo ""
+  echo "Cleaned $cleaned profile(s), skipped $skipped."
+  if [ "$skipped" -gt 0 ] && ! $force; then
+    echo ""
+    echo "To also kill active Chrome instances and clean their profiles, add --force."
+  fi
+}
+
+# --- Doctor: non-destructive health check ---
+
+doctor() {
+  if [ ! -f "$REGISTRY" ]; then
+    echo "No registry found. Run: $CMD_NAME --scan"
+    return 1
+  fi
+
+  local entries=$(get_entries)
+  local issues=0
+  local dead_list=""
+
+  echo ""
+  echo "Chrome DevTools MCP Doctor"
+  echo "==========================="
+  echo ""
+  echo "Checking registered projects..."
+
+  if [ -n "$entries" ]; then
+    while IFS='|' read -r name port short_path; do
+      local full_path=$(echo "$short_path" | sed "s|^~|$HOME|")
+      local mcp="$full_path/.mcp.json"
+
+      if [ ! -d "$full_path" ]; then
+        echo "  [STALE]      $name: directory no longer exists ($short_path)"
+        issues=$((issues + 1))
+        continue
+      fi
+
+      if [ ! -f "$mcp" ]; then
+        echo "  [STALE]      $name: .mcp.json missing in $short_path"
+        issues=$((issues + 1))
+        continue
+      fi
+
+      if ! grep -q '"chrome-devtools"' "$mcp" 2>/dev/null; then
+        echo "  [STALE]      $name: chrome-devtools entry no longer in .mcp.json"
+        issues=$((issues + 1))
+        continue
+      fi
+
+      local detected_port=$(grep -Eo '(127\.0\.0\.1|localhost):[0-9]+' "$mcp" 2>/dev/null | head -1 | cut -d: -f2)
+
+      if [ -z "$detected_port" ]; then
+        echo "  [WARN]       $name: chrome-devtools uses a host other than 127.0.0.1/localhost — port undetectable"
+        issues=$((issues + 1))
+        continue
+      fi
+
+      if [ "$detected_port" != "$port" ]; then
+        echo "  [DRIFT]      $name: registry says $port but .mcp.json has $detected_port"
+        issues=$((issues + 1))
+        continue
+      fi
+
+      # Liveness checks (config is valid; is Chrome actually running correctly?)
+      local profile_dir="/tmp/chrome-$name"
+      local running_port=$(get_running_chrome_port "$profile_dir")
+
+      if [ -n "$running_port" ] && [ "$running_port" != "$port" ]; then
+        echo "  [WRONG-PORT] $name: Chrome is running for this profile on port $running_port, but .mcp.json wants $port"
+        echo "               Fix: pkill -f \"user-data-dir=$profile_dir\" && cd $short_path && $CMD_NAME"
+        issues=$((issues + 1))
+        continue
+      fi
+
+      if [ -z "$running_port" ]; then
+        # Chrome not running for this profile. Confirm port really isn't listening
+        # before marking dead (some other process could theoretically hold it).
+        if command -v curl &>/dev/null && ! curl -sf -m 1 "http://127.0.0.1:$port/json/version" >/dev/null 2>&1; then
+          dead_list="${dead_list}${name}|${port}
+"
+        fi
+      fi
+    done <<< "$entries"
+  fi
+
+  local conflicts=$(echo "$entries" | cut -d'|' -f2 | sort | uniq -d)
+  if [ -n "$conflicts" ]; then
+    for dup_port in $conflicts; do
+      local projects=$(echo "$entries" | grep "|$dup_port|" | cut -d'|' -f1 | tr '\n' ', ' | sed 's/,$//')
+      echo "  [CONFLICT]   port $dup_port used by: $projects"
+      issues=$((issues + 1))
+    done
+  fi
+
+  if [ -n "$dead_list" ]; then
+    echo ""
+    echo "Inactive projects (Chrome not currently running — informational, not counted):"
+    while IFS='|' read -r dead_name dead_port; do
+      [ -z "$dead_name" ] && continue
+      echo "  [DEAD]       $dead_name (port $dead_port)"
+    done <<< "$dead_list"
+  fi
+
+  echo ""
+  echo "Scanning search paths for unregistered projects..."
+  local search_paths=($(get_search_paths))
+  for pattern in "${search_paths[@]}"; do
+    local expanded=$(echo "$pattern" | sed "s|^~|$HOME|")
+    for file in $expanded/.mcp.json; do
+      [ -f "$file" ] || continue
+      grep -q '"chrome-devtools"' "$file" 2>/dev/null || continue
+      local project_dir=$(dirname "$file")
+      local short_path=$(echo "$project_dir" | sed "s|$HOME|~|")
+      local project_name=$(basename "$project_dir")
+      if ! echo "$entries" | grep -qF "|$short_path"; then
+        echo "  [ORPHAN]     $project_name at $short_path (not in registry)"
+        issues=$((issues + 1))
+      fi
+    done
+  done
+
+  echo ""
+  if [ "$issues" -eq 0 ]; then
+    echo "All good. No issues found."
+  else
+    echo "Found $issues issue(s)."
+    echo ""
+    echo "Suggested actions:"
+    echo "  $CMD_NAME --scan                              Rebuild registry from disk (fixes STALE, DRIFT, ORPHAN)"
+    echo "  cd <project> && $CMD_NAME --remove            Drop a stale/unwanted entry"
+    echo "  cd <project> && $CMD_NAME --remove && $CMD_NAME --add   Reassign a conflicting port"
+  fi
+  echo ""
+}
+
+# --- Remove chrome-devtools from current project ---
+
+remove_from_project() {
+  if ! command -v jq &>/dev/null; then
+    echo "Error: jq is required for --remove"
+    echo ""
+    echo "Install it:"
+    echo "  macOS:         brew install jq"
+    echo "  Ubuntu/Debian: sudo apt install jq"
+    echo "  Fedora/RHEL:   sudo dnf install jq"
+    return 1
+  fi
+
+  local project_name=$(basename "$PWD")
+  local mcp_file=".mcp.json"
+
+  if [ ! -f "$mcp_file" ]; then
+    echo "No .mcp.json found in current directory — nothing to remove."
+    echo "Refreshing registry anyway to drop any stale entry for '$project_name'..."
+    echo ""
+  elif ! jq -e '.mcpServers["chrome-devtools"]' "$mcp_file" &>/dev/null; then
+    echo "chrome-devtools is not configured in $mcp_file — nothing to remove."
+    echo "Refreshing registry anyway to drop any stale entry for '$project_name'..."
+    echo ""
+  else
+    local existing_port=$(grep -Eo '(127\.0\.0\.1|localhost):[0-9]+' "$mcp_file" | head -1 | cut -d: -f2)
+
+    local tmp=$(mktemp)
+    jq 'del(.mcpServers["chrome-devtools"])' "$mcp_file" > "$tmp" && mv "$tmp" "$mcp_file"
+
+    echo "Removed chrome-devtools from $project_name (was on port $existing_port)"
+    echo "File: $(pwd)/$mcp_file"
+    echo ""
+  fi
 
   scan_projects
   show_registry
@@ -373,6 +711,11 @@ show_help() {
   echo "  $CMD_NAME --list       Show port registry"
   echo "  $CMD_NAME --scan       Rescan all projects and update registry"
   echo "  $CMD_NAME --add [port] Add chrome-devtools to current project"
+  echo "  $CMD_NAME --remove     Remove chrome-devtools from current project"
+  echo "  $CMD_NAME --doctor     Run a non-destructive health check on the registry"
+  echo "  $CMD_NAME --clean      Delete the current project's /tmp/chrome-<project> profile"
+  echo "  $CMD_NAME --clean --all    Delete every /tmp/chrome-* profile (skips active instances)"
+  echo "  $CMD_NAME --clean --force  With --all: also kill active Chrome instances first"
   echo "  $CMD_NAME --path <dir> Add a search path (e.g. ~/Projects/*)"
   echo "  $CMD_NAME --help       Show this help"
   echo ""
@@ -410,6 +753,16 @@ case "$1" in
     ;;
   --add)
     add_to_project "$2"
+    ;;
+  --remove)
+    remove_from_project
+    ;;
+  --doctor)
+    doctor
+    ;;
+  --clean)
+    shift
+    clean_profiles "$@"
     ;;
   --path)
     add_path "$2"
