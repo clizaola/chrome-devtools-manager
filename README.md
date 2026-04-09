@@ -4,9 +4,40 @@ A command-line tool to manage [Chrome DevTools MCP](https://github.com/ChromeDev
 
 Built for developers who work on multiple projects simultaneously and need Chrome DevTools MCP running in each one without port collisions.
 
+## Table of contents
+
+- [The Problem](#the-problem)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+  - [Updating](#updating)
+  - [Single-file alternative](#single-file-alternative)
+- [Usage](#usage)
+  - [Launch Chrome for the current project](#launch-chrome-for-the-current-project)
+  - [View port registry](#view-port-registry)
+  - [Scan for projects](#scan-for-projects)
+  - [Add Chrome DevTools MCP to a project](#add-chrome-devtools-mcp-to-a-project)
+  - [Remove Chrome DevTools MCP from a project](#remove-chrome-devtools-mcp-from-a-project)
+  - [Run a health check (`--doctor`)](#run-a-health-check---doctor)
+  - [Clean up profile directories (`--clean`)](#clean-up-profile-directories---clean)
+  - [Add custom search paths](#add-custom-search-paths)
+- [Configuration File](#configuration-file)
+- [How It Works](#how-it-works)
+  - [Port detection](#port-detection)
+  - [Chrome isolation](#chrome-isolation)
+  - [Port auto-assignment](#port-auto-assignment)
+  - [Launch guards](#launch-guards)
+- [Platform Support](#platform-support)
+- [Caveats and Known Limitations](#caveats-and-known-limitations)
+- [Troubleshooting](#troubleshooting)
+- [Quick Reference](#quick-reference)
+- [Optional: Short alias](#optional-short-alias)
+- [Feedback and Issues](#feedback-and-issues)
+- [License](#license)
+
 ## The Problem
 
-When using Chrome DevTools MCP with tools like [Claude Code](https://claude.com/claude-code), each project needs its own Chrome instance on a unique debugging port. With 2-3 projects this is manageable, but with 8-10+ projects it becomes a nightmare:
+When using Chrome DevTools MCP with tools like [Claude Code](https://claude.com/claude-code), each project needs its own Chrome instance on a unique debugging port. With two or three projects this is manageable by hand. Once you're juggling ten or more, it falls apart:
 
 - Which port did I assign to which project?
 - Is port 9225 already taken?
@@ -128,7 +159,7 @@ This reads the port from the project's `.mcp.json` and launches an isolated Chro
 
 The launcher also:
 
-- **Refuses to launch** if a Chrome process is already running for this project's profile directory on a different port (Chrome's profile singleton would silently ignore the new port flag, so this would be a foot-gun). It tells you exactly which command to run to kill the stale instance.
+- **Refuses to launch** if a Chrome process is already running for this project's profile directory on a different port. Chrome's profile singleton would otherwise silently ignore the new `--remote-debugging-port` flag and reuse the existing session on the old port, so the launcher fails fast and prints the exact `pkill` command to clear the stale instance.
 - **Verifies Chrome actually bound the port** after launch by polling `http://127.0.0.1:<port>/json/version` for up to 5 seconds. If the endpoint doesn't respond, you get a warning instead of a silent failure.
 
 ### View port registry
@@ -390,6 +421,17 @@ This means each project gets its own:
 
 When using `--add` without specifying a port, the tool reads the registry, finds the highest port in use, and assigns the next one. The starting port is `9222` (the Chrome DevTools Protocol default).
 
+### Launch guards
+
+Every `chrome-devtools-manager` launch goes through two safety checks that exist to prevent silent failures:
+
+1. **Singleton guard (before launch).** The tool inspects the running process list with `ps` and looks for any Chrome main process already using `--user-data-dir=/tmp/chrome-<project>`. If one is found:
+   - **Same port as `.mcp.json`:** the existing session is healthy, nothing to do. The tool verifies the CDP endpoint is still responding and returns success.
+   - **Different port:** the tool refuses to launch and prints the exact `pkill` command to clear the stale instance. This is critical because Chrome would otherwise silently ignore the new port flag and redirect the launch into the existing session (a behavior that used to cause confusing "MCP can't connect" errors).
+2. **CDP verification (after launch).** After spawning Chrome, the tool polls `http://127.0.0.1:<port>/json/version` via `curl` up to 20 times (~5 seconds). If the endpoint responds, you get a confirmation message. If it doesn't, you get a warning that points at `--doctor` and `pkill`, so you know the launch didn't actually take effect.
+
+Both checks can be observed in action through `--doctor`, which uses the same underlying helpers and reports any inconsistency as `[WRONG-PORT]` or `[DEAD]`.
+
 ## Platform Support
 
 The script automatically detects your operating system and finds the correct Chrome/Chromium executable. No manual configuration needed.
@@ -427,7 +469,7 @@ Works under WSL2 (Windows Subsystem for Linux). The script detects WSL2 automati
 
 1. **Chrome must not already be running without `--user-data-dir`:** If Chrome is already open normally, launching a new instance requires `--user-data-dir` to create a separate profile. The tool always uses `--user-data-dir`, so this is handled automatically.
 
-2. **Temp profiles are cleared on reboot:** User profiles are stored in `/tmp/chrome-<project>`, which is cleared when you restart your machine. If you need persistent sessions (staying logged in, etc.), change the path in the script to a permanent location like `~/.chrome-devtools/<project>`.
+2. **Temp profiles are cleared on reboot:** User profiles are stored in `/tmp/chrome-<project>`, which most systems clear on restart. This is intentional — it keeps profiles tidy and reclaims disk space automatically. If you need persistent sessions (staying logged in, etc.), you'll need to edit the script to point `--user-data-dir` at a permanent location (e.g. `~/.chrome-devtools/<project>`). If you do, remember to update the `clean_profiles` function too so `--clean` can still find them.
 
 3. **Port detection is grep-based:** The tool searches for `127.0.0.1:<port>` or `localhost:<port>` in `.mcp.json`. Other hostnames (e.g. `0.0.0.0`, custom domains) will not be detected.
 
@@ -479,7 +521,7 @@ If doctor shows `[WRONG-PORT]`, see the next section.
 
 ### `[WRONG-PORT]` or `Error: Chrome is already running for '<project>' on port X, but .mcp.json is configured for port Y`
 
-**This is the most common gotcha, and the one that burned the tool's author into adding every feature on this page.**
+This is the most common pitfall when a project's port changes after Chrome is already running. The launcher now catches it explicitly, but the underlying behavior is worth understanding.
 
 **Root cause:** Chrome has a "profile singleton" behavior. If you launch a second Chrome process pointing at a `--user-data-dir` that is already in use by another Chrome process, Chrome **silently ignores the new `--remote-debugging-port` flag** and just opens a new window in the existing session. The old port stays bound; the new port never comes up.
 
@@ -547,21 +589,38 @@ chrome-devtools-manager --scan
 
 ## Quick Reference
 
+### Core
+
 | Command | Description |
 |---------|-------------|
 | `chrome-devtools-manager` | Launch Chrome for current project |
-| `chrome-devtools-manager --list` | Show port registry |
-| `chrome-devtools-manager --scan` | Rescan projects, rebuild registry |
-| `chrome-devtools-manager --add` | Add chrome-devtools to current project (auto port) |
-| `chrome-devtools-manager --add 9225` | Add with specific port |
-| `chrome-devtools-manager --remove` | Remove chrome-devtools from current project |
-| `chrome-devtools-manager --doctor` | Non-destructive health check (stale, drift, conflicts, orphans) |
+| `chrome-devtools-manager --help` | Show help |
+
+### Project configuration
+
+| Command | Description |
+|---------|-------------|
+| `chrome-devtools-manager --add` | Add `chrome-devtools` to current project (auto-assigns next free port) |
+| `chrome-devtools-manager --add 9225` | Add with a specific port |
+| `chrome-devtools-manager --remove` | Remove `chrome-devtools` from current project's `.mcp.json` |
+
+### Registry
+
+| Command | Description |
+|---------|-------------|
+| `chrome-devtools-manager --list` | Show the port registry |
+| `chrome-devtools-manager --scan` | Rescan search paths and rebuild the registry |
+| `chrome-devtools-manager --path "~/Dir/*"` | Add a search path |
+
+### Diagnostics and cleanup
+
+| Command | Description |
+|---------|-------------|
+| `chrome-devtools-manager --doctor` | Non-destructive health check (stale, drift, conflict, wrong-port, dead, orphan) |
 | `chrome-devtools-manager --clean` | Delete current project's `/tmp/chrome-<project>` profile |
-| `chrome-devtools-manager --clean --force` | Current project: kill Chrome first if active, then delete |
+| `chrome-devtools-manager --clean --force` | Delete current project's profile, killing Chrome if active |
 | `chrome-devtools-manager --clean --all` | Delete every `/tmp/chrome-*` profile (skips active instances) |
 | `chrome-devtools-manager --clean --all --force` | Kill every active Chrome and wipe every profile |
-| `chrome-devtools-manager --path "~/Dir/*"` | Add a search path |
-| `chrome-devtools-manager --help` | Show help |
 
 ## Optional: Short alias
 
@@ -571,7 +630,16 @@ If `chrome-devtools-manager` is too long to type, add an alias to your `~/.zshrc
 alias cdm='chrome-devtools-manager'
 ```
 
-Then use `cdm`, `cdm --list`, `cdm --add`, etc.
+Then you can use the shorter form for every command:
+
+```bash
+cdm                 # launch Chrome for current project
+cdm --list          # show port registry
+cdm --doctor        # run a health check
+cdm --add           # add chrome-devtools to current project
+cdm --remove        # remove chrome-devtools from current project
+cdm --clean         # clean current project's profile dir
+```
 
 ## Feedback and Issues
 
@@ -581,4 +649,4 @@ Then use `cdm`, `cdm --list`, `cdm --add`, etc.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE) for the full text.
